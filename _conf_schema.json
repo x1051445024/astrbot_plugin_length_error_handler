@@ -1,0 +1,74 @@
+{
+  "enable_context_compression": {
+    "description": "是否启用对话上下文压缩功能",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会在 prompt 过长时自动压缩早期对话"
+  },
+  "compression_threshold": {
+    "description": "Runner 层触发压缩的 prompt_tokens 阈值（粗估）",
+    "type": "int",
+    "default": 35000,
+    "hint": "当 runner 可见上下文估算超过此值时触发压缩，建议 30000~60000"
+  },
+  "provider_compression_threshold": {
+    "description": "OpenAI Provider 层触发压缩的 messages tokens 阈值（粗估）",
+    "type": "int",
+    "default": 50000,
+    "hint": "Provider 发送前兜底压缩阈值。日志中 prompt_tokens 过大时可调低"
+  },
+  "keep_recent_rounds": {
+    "description": "压缩时保留最近的非 system 消息数",
+    "type": "int",
+    "default": 4,
+    "hint": "保留最近 N 条非 system 消息，之前的用摘要替换"
+  },
+  "summary_max_tokens": {
+    "description": "LLM 生成摘要时使用的最大 token 数",
+    "type": "int",
+    "default": 512,
+    "hint": "控制摘要长度，建议 256~1024"
+  },
+  "max_older_messages_for_summary": {
+    "description": "参与摘要计算的最多早期消息条数",
+    "type": "int",
+    "default": 20,
+    "hint": "避免摘要提示词本身过长"
+  },
+  "enable_learning": {
+    "description": "是否记录 LengthFinishReasonError 错误日志",
+    "type": "bool",
+    "default": true,
+    "hint": "用于统计和分析 length error 发生情况"
+  },
+  "enable_provider_patch": {
+    "description": "是否启用 OpenAI Provider 层兜底 patch",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后可捕获 openai_source final completion/parse 阶段的 length 错误并重试"
+  },
+  "enable_retry_on_length_error": {
+    "description": "捕获 length 错误后是否自动重试一次",
+    "type": "bool",
+    "default": true,
+    "hint": "重试前会扩大输出预算并强制压缩 messages"
+  },
+  "min_completion_tokens": {
+    "description": "最小输出 token 预算",
+    "type": "int",
+    "default": 2048,
+    "hint": "当请求里的 max_tokens/max_completion_tokens 小于此值时自动抬高"
+  },
+  "retry_completion_tokens": {
+    "description": "Length 错误重试时的输出 token 预算",
+    "type": "int",
+    "default": 4096,
+    "hint": "第一次因为 length 截断失败后，重试请求使用的输出预算"
+  },
+  "force_reasoning_effort_low": {
+    "description": "是否将 reasoning_effort 降为 low",
+    "type": "bool",
+    "default": true,
+    "hint": "可减少 reasoning tokens 吃满输出预算导致正文无法解析的问题"
+  }
+}

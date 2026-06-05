@@ -1,0 +1,20 @@
+name: astrbot_plugin_length_error_handler
+display_name: 长度错误处理器
+desc: 自动处理 OpenAI LengthFinishReasonError（finish_reason=length），实现上下文压缩、输出预算修正、Provider 兜底重试与 fallback。支持 WebUI 配置。
+version: 1.0.6
+author: Kurisu
+repo: "https://github.com/x1051445024/astrbot_plugin_length_error_handler"
+tags: ["error-handling", "llm", "context-management", "length-error"]
+meta:
+  arch: "all"
+  hardware: "all"
+  platform: "all"
+  require_astrbot_version: ">=4.0.0"
+  module_name: "main"
+  module_version: "1.0.6"
+  module_author: "Kurisu"
+  module_description: "Length error auto-recovery + output budget guard + provider-level retry plugin with WebUI config"
+  module_homepage: "https://github.com/x1051445024/astrbot_plugin_length_error_handler"
+  module_license: "MIT"
+  module_type: "plugin"
+  module_class: "LengthErrorHandlerPlugin"
