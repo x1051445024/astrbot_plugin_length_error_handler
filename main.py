@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
 
 @register(
     "astrbot_plugin_length_error_handler",
-    "Kurisu",
+    "牧濑红莉栖（BOT）",
     "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.6）",
     "1.0.6",
     "",
