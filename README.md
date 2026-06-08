@@ -1,20 +1,21 @@
 # 长度错误处理器
 
-自动处理 AstrBot 在调用 OpenAI 兼容 Provider 时可能出现的 `LengthFinishReasonError` / `finish_reason=length` 问题。
+自动处理 AstrBot 调用 OpenAI 兼容 Provider 时常见的 `LengthFinishReasonError`、`finish_reason=length`、输出 token 预算不足和长上下文导致的失败。
 
-本插件会在上下文过长或输出预算不足时，尝试进行上下文压缩、输出 token 预算修正、reasoning 降档，并在捕获 length 截断错误后自动重试一次，降低长对话、工具调用链较长时的失败概率。
+本插件会在请求发送前或 length 截断错误发生后，尝试压缩上下文、调整输出预算、降低 reasoning 强度，并修复工具调用消息配对，降低长对话和多轮工具调用场景下的失败概率。
 
 ## 功能特性
 
 - 自动识别 `LengthFinishReasonError`、`finish_reason=length`、`max_tokens` / `max_completion_tokens` 相关截断错误。
-- Runner 层上下文压缩：在对话历史过长时，将较早消息折叠成摘要，只保留最近消息。
-- OpenAI Provider 层兜底 patch：在请求发送前检查并修正 payload。
-- 自动抬高输出预算：当 `max_tokens` 或 `max_completion_tokens` 过低时，自动提高到配置值。
-- length 错误自动重试：捕获截断错误后，强制压缩 messages 并提高重试输出预算。
+- Runner 层上下文压缩：当对话历史过长时，将较早消息折叠为摘要，只保留最近消息。
+- OpenAI Provider 层兜底 patch：请求发送前检查并修正 payload。
+- 自动提高输出预算：当 `max_tokens` 或 `max_completion_tokens` 太低时，按配置提升到更安全的值。
+- length 错误自动重试：捕获截断错误后强制压缩 messages，并使用更高输出预算重试一次。
 - reasoning 降档：可将 `reasoning_effort` 调整为 `low`，减少推理 token 挤占正文输出空间。
-- 工具调用配对修复：压缩上下文时尽量保留必要的 assistant tool_call 与 tool 输出配对，避免 OpenAI 400 错误。
+- 工具调用配对修复：压缩上下文时尽量保留必要的 assistant tool_call 与 tool 输出配对，清理孤立输出。
+- 空 ID 防护：过滤没有有效 `call_id` / `tool_call_id` 的工具输出，避免上游返回 `empty string` 400。
 - 错误日志记录：记录 length error 出现次数、阶段、模型和 token 使用信息，方便排障。
-- 支持 WebUI 配置。
+- 支持 AstrBot WebUI 配置。
 
 ## 适用场景
 
@@ -25,6 +26,7 @@
 - 模型输出预算太小，导致 response 被截断。
 - reasoning 模型把大量 token 用在推理阶段，正文未完整返回。
 - 多轮工具调用压缩后出现 tool_call / tool_result 配对问题。
+- 本地 octopus 或 OpenAI 兼容接口提示 `call_id` 为空或工具调用配对错误。
 
 ## 安装方式
 
@@ -90,157 +92,91 @@ data/plugins_data/length_error_handler/config.json
 
 清空插件记录的 length error 日志。
 
-### 查看压缩配置测试信息
+### 查看插件配置摘要
 
 ```text
 /length_compress_test
 ```
 
-返回当前上下文压缩、阈值、输出预算、Provider patch、reasoning 降档等配置状态。
-
-## 日志位置
-
-当 `enable_learning=true` 时，插件会记录 length error 日志：
-
-```text
-data/plugins_data/length_error_handler/length_error.jsonl
-```
-
-每条日志包含：
-
-- 时间戳
-- 捕获阶段：Runner / Provider Query / Provider Stream
-- 错误类型
-- 错误摘要
-- prompt tokens
-- completion tokens
-- total tokens
-- 模型名称
+返回当前压缩、重试、Provider patch 等配置状态。
 
 ## 工作机制
 
-插件启动后会注入两层处理逻辑。
+### Runner 层
 
-### 1. Runner 层
+插件会 patch `ToolLoopAgentRunner._iter_llm_responses_with_fallback`：
 
-在 `ToolLoopAgentRunner._iter_llm_responses_with_fallback` 前后进行处理：
+1. 请求前按阈值检查上下文长度。
+2. 超阈值时将旧消息折叠为摘要，保留最近消息。
+3. 捕获 length 截断错误时记录日志。
+4. 强制压缩上下文、提高输出预算后重试一次。
 
-1. 调用前检查上下文长度。
-2. 必要时压缩早期消息。
-3. 修正模型输出预算。
-4. 如果捕获 length 错误，则记录日志、强制压缩、提高输出预算并重试。
+### OpenAI Provider 层
 
-### 2. OpenAI Provider 层
+插件会 patch `ProviderOpenAIOfficial._query` 和 `_query_stream`：
 
-在 `ProviderOpenAIOfficial._query` 和 `_query_stream` 处进行兜底：
-
-1. 深拷贝 payload，避免直接污染原始请求。
+1. 深拷贝 payload，避免直接污染原始请求对象。
 2. 修正 `max_tokens` / `max_completion_tokens`。
-3. 将 `reasoning_effort` 调低。
+3. 可将 `reasoning_effort` 降为 `low`。
 4. 根据阈值压缩 `messages`。
-5. 修复 tool_call 与 tool 输出配对。
-6. 捕获 length 错误后再强制压缩并重试一次。
+5. 修复 assistant tool_call 与 tool 输出配对。
+6. 移除孤立或没有有效 ID 的工具输出。
+7. 捕获 length 错误后强制压缩并重试一次。
 
-## 压缩策略
+## 与 callid_sanitizer 的关系
 
-上下文压缩时，插件会：
+`astrbot_plugin_callid_sanitizer` 主要负责请求发送前清理过长或无效的工具调用 ID。本插件主要负责 length 截断和长上下文恢复。
 
-- 保留所有 system 消息。
-- 保留最近 `keep_recent_rounds` 条非 system 消息。
-- 将更早的消息转换为一条 system 摘要。
-- 摘要最多参考最近 `max_older_messages_for_summary` 条旧消息。
-- 尽量补回被保留 tool 输出所依赖的 assistant tool_call 消息。
-- 移除孤立的 tool/function 输出，避免 OpenAI 报错。
+两个插件可以同时启用：
 
-压缩摘要会带有类似标记：
+- `callid_sanitizer` 更偏向 ID 卫生和空/超长 ID 防护。
+- `length_error_handler` 更偏向上下文压缩、输出预算和 length 错误重试。
 
-```text
-[LengthErrorHandler 自动压缩] 已折叠 N 条较早消息，仅保留摘要和最近 M 条必要消息。
+如果遇到本地 octopus 报错 `Invalid input[x].call_id: empty string`，建议同时更新两个插件，并清理当前出错会话的历史上下文。
+
+## 排错建议
+
+### 更新后仍然报 `call_id` 为空
+
+旧会话历史里可能已经保存了坏的工具调用记录。请尝试：
+
+1. 清空该会话上下文或新建会话。
+2. 重启 AstrBot。
+3. 确认 `sanitize_tool_call_pairs=true`。
+4. 确认 `astrbot_plugin_callid_sanitizer` 也已更新到最新版本。
+
+### 长对话仍然触发 length 错误
+
+可以尝试降低阈值：
+
+```yaml
+compression_threshold: 25000
+provider_compression_threshold: 30000
+keep_recent_rounds: 3
+retry_completion_tokens: 4096
 ```
-
-## 调参建议
-
-### 长对话仍然容易失败
-
-可以适当降低：
-
-```text
-provider_compression_threshold: 30000~40000
-compression_threshold: 25000~35000
-```
-
-### 输出仍然被截断
-
-可以适当提高：
-
-```text
-min_completion_tokens: 4096
-retry_completion_tokens: 8192
-```
-
-前提是你的模型和 Provider 支持对应输出上限。
 
 ### 工具调用链容易报 400
 
-保持开启：
+建议保持：
 
-```text
+```yaml
 sanitize_tool_call_pairs: true
+enable_provider_patch: true
 ```
 
-不要随意关闭该项。
-
-### reasoning 模型正文输出太少
-
-保持开启：
-
-```text
-force_reasoning_effort_low: true
-```
-
-这可以减少 reasoning token 占用过多输出预算的情况。
+并尽量避免多个会改写 messages 的插件同时做激进压缩。
 
 ## 注意事项
 
+- 本插件通过 monkey patch 注入 AstrBot 内部 Runner 和 OpenAI Provider，AstrBot 内部 API 大版本变化时可能需要适配。
 - 本插件只能降低 length 类错误概率，不能突破模型本身的最大上下文窗口或最大输出限制。
-- 如果 Provider 或模型不支持较高的 `max_tokens`，请不要把 `retry_completion_tokens` 设置得过大。
-- 上下文压缩会丢失部分早期细节，因此关键需求建议在当前对话中重新明确。
-- 插件通过 monkey patch 注入 AstrBot 内部 Runner 和 OpenAI Provider，AstrBot 内部 API 大版本变化时可能需要适配。
-- `metadata.yaml` 中的 `name` 是插件加载标识，不建议改成中文。
+- 插件会清理孤立工具输出；极少数情况下，过旧工具结果会被摘要替代，不再保留原始完整内容。
+- 建议在更新插件后重启 AstrBot。
 
-## 兼容性
+## 版本信息
 
 - 插件标识：`astrbot_plugin_length_error_handler`
-- 显示名称：`长度错误处理器`
-- 当前版本：`1.0.6`
-- 建议 AstrBot 版本：`>=4.0.0`
-- Provider：主要针对 OpenAI 官方兼容 Provider。
-
-## 常见问题
-
-### 1. 为什么已经压缩了还是报错？
-
-可能原因：
-
-- 模型上下文窗口本身太小。
-- 用户输入、工具结果或系统提示一次性过长。
-- Provider 实际支持的输出上限低于配置值。
-- 工具调用返回内容太大，单次响应已经超过限制。
-
-可以尝试降低压缩阈值，或减少工具返回内容。
-
-### 2. 为什么历史上下文里出现自动压缩提示？
-
-这是插件为了保留早期对话关键信息写入的摘要消息，不是异常。
-
-### 3. 为什么会移除部分 tool/function 输出？
-
-OpenAI 要求 tool 输出必须能找到对应的 assistant tool_call。上下文压缩后如果配对不完整，保留孤立 tool 输出会导致 400 错误。因此插件会清理孤立输出。
-
-### 4. 为什么不要改插件 name？
-
-`name` 是 AstrBot 识别和加载插件的内部标识。中文显示名请使用 `display_name`，不要修改 `name`。
-
-## 许可证
-
-MIT
+- 当前版本：`1.0.7`
+- 作者：Kurisu
+- 仓库：https://github.com/x1051445024/astrbot_plugin_length_error_handler
