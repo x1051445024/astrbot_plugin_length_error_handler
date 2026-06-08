@@ -440,8 +440,8 @@ class LengthErrorHandlerPlugin(Star):
             for msg in repaired:
                 if self._is_tool_output_message(msg):
                     tm_ids = self._tool_result_ids_from_message(msg)
-                    if tm_ids and not (tm_ids & retained_assistant_ids):
-                        dropped_outputs += len(tm_ids)
+                    if not tm_ids or not (tm_ids & retained_assistant_ids):
+                        dropped_outputs += max(1, len(tm_ids))
                         continue
                 final.append(msg)
             repaired = final
@@ -614,7 +614,7 @@ class LengthErrorHandlerPlugin(Star):
         for part in content:
             if isinstance(part, dict) and self._is_tool_output_part(part):
                 part_ids = self._tool_result_ids_from_part(part)
-                if part_ids and not (part_ids & valid_ids):
+                if not part_ids or not (part_ids & valid_ids):
                     dropped += 1
                     continue
             filtered.append(part)
@@ -656,8 +656,8 @@ class LengthErrorHandlerPlugin(Star):
                     call_id = tool_call.get("id") or tool_call.get("call_id")
                 else:
                     call_id = getattr(tool_call, "id", None) or getattr(tool_call, "call_id", None)
-                if call_id:
-                    ids.add(str(call_id))
+                if self._has_non_empty_id(call_id):
+                    ids.add(str(call_id).strip())
         parts = content if isinstance(content, list) else []
         for part in parts:
             if not isinstance(part, dict):
@@ -665,8 +665,8 @@ class LengthErrorHandlerPlugin(Star):
             if self._is_tool_call_part(part):
                 for key in ("call_id", "id", "tool_call_id"):
                     value = part.get(key)
-                    if value:
-                        ids.add(str(value))
+                    if self._has_non_empty_id(value):
+                        ids.add(str(value).strip())
         return ids
 
     def _collect_tool_result_ids(self, messages: Any) -> set[str]:
@@ -682,14 +682,14 @@ class LengthErrorHandlerPlugin(Star):
         if isinstance(msg, dict):
             for key in ("tool_call_id", "call_id", "tool_use_id"):
                 value = msg.get(key)
-                if value:
-                    ids.add(str(value))
+                if self._has_non_empty_id(value):
+                    ids.add(str(value).strip())
             content = msg.get("content")
         else:
             for key in ("tool_call_id", "call_id", "tool_use_id"):
                 value = getattr(msg, key, None)
-                if value:
-                    ids.add(str(value))
+                if self._has_non_empty_id(value):
+                    ids.add(str(value).strip())
             content = getattr(msg, "content", None)
         parts = content if isinstance(content, list) else []
         for part in parts:
@@ -702,9 +702,13 @@ class LengthErrorHandlerPlugin(Star):
         ids: set[str] = set()
         for key in ("call_id", "tool_call_id", "tool_use_id"):
             value = part.get(key)
-            if value:
-                ids.add(str(value))
+            if LengthErrorHandlerPlugin._has_non_empty_id(value):
+                ids.add(str(value).strip())
         return ids
+
+    @staticmethod
+    def _has_non_empty_id(value: Any) -> bool:
+        return value is not None and bool(str(value).strip())
 
     def _is_tool_output_message(self, msg: Any) -> bool:
         if isinstance(msg, dict):
