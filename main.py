@@ -230,8 +230,6 @@ class LengthErrorHandlerPlugin(Star):
         self._normalize_reasoning(prepared)
         if self.cfg.get("enable_context_compression", True):
             self._maybe_compress_payload_messages(prepared, force=force_compress)
-        if self.cfg.get("sanitize_tool_call_pairs", True):
-            self._repair_tool_call_pairs(prepared.get("messages"))
         return prepared
 
     def _ensure_payload_budget(self, payloads: dict, retry: bool):
@@ -300,8 +298,13 @@ class LengthErrorHandlerPlugin(Star):
             logger.warning(f"[LengthErrorHandler] Runner 上下文压缩失败: {exc}")
 
     def _compress_messages(self, messages: list[Any], keep_recent: int) -> list[Any]:
-        system_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-        non_system = [m for m in messages if not (isinstance(m, dict) and m.get("role") == "system")]
+        def _get_role(m):
+            return m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
+        def _get_content(m):
+            return m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+
+        system_msgs = [m for m in messages if _get_role(m) == "system"]
+        non_system = [m for m in messages if _get_role(m) != "system"]
         if len(non_system) <= keep_recent:
             return messages
         recent = non_system[-keep_recent:]
@@ -310,10 +313,8 @@ class LengthErrorHandlerPlugin(Star):
         max_older = int(self.cfg.get("max_older_messages_for_summary", 20))
         lines = []
         for msg in older[-max_older:]:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role", "unknown")
-            text = self._content_to_text(msg.get("content"))
+            role = _get_role(msg) or "unknown"
+            text = self._content_to_text(_get_content(msg))
             if text:
                 lines.append(f"- {role}: {text[:180]}")
         summary = (
@@ -339,8 +340,6 @@ class LengthErrorHandlerPlugin(Star):
 
         protected: list[Any] = []
         for msg in older:
-            if not isinstance(msg, dict):
-                continue
             call_ids = self._assistant_tool_call_ids_from_message(msg)
             if call_ids & missing_ids:
                 protected.append(msg)
@@ -356,60 +355,167 @@ class LengthErrorHandlerPlugin(Star):
         return protected + recent
 
     def _repair_tool_call_pairs(self, messages: Any) -> Any:
-        """Keep OpenAI tool-call history valid in both directions.
+        """Pure forward scan: group assistants with their immediately following
+        tool messages, keep only complete pairs, discard everything else.
 
         Chat Completions requires every assistant message with tool_calls to be
         immediately followed by tool messages for each tool_call_id. Context
-        compression can cut either side of that pair, so repair both cases:
-        1. strip unanswered assistant tool_calls;
-        2. remove tool/function outputs that no retained assistant call owns.
+        compression can cut either side of that pair.
+
+        This implementation uses two passes:
+        Pass 1 — forward scan, keep system/user/plain-text + complete pairs.
+        Pass 2 — collect retained assistant call_ids, remove orphan tool messages
+                 whose call_ids refer to assistants that were dropped in Pass 1.
         """
         if not isinstance(messages, list):
             return messages
 
-        dropped_calls = self._drop_unanswered_assistant_tool_calls(messages)
-        valid_ids = self._collect_assistant_tool_call_ids(messages)
-        if not valid_ids:
-            self._drop_all_tool_outputs(messages)
-            if dropped_calls:
-                logger.warning(
-                    "[LengthErrorHandler] 已移除 %s 个缺少后续 tool 结果的 assistant tool_call",
-                    dropped_calls,
-                )
-            return messages
-
+        # ---- pass 1: forward walk, keep complete pairs only ----
         repaired: list[Any] = []
+        dropped_calls = 0
         dropped_outputs = 0
-        for msg in messages:
-            if self._is_tool_output_message(msg):
-                result_ids = self._tool_result_ids_from_message(msg)
-                if result_ids and not (result_ids & valid_ids):
-                    dropped_outputs += 1
+
+        idx = 0
+        while idx < len(messages):
+            msg = messages[idx]
+
+            # system / user / plain assistant → always keep
+            if not self._is_assistant_with_tool_calls(msg) and not self._is_tool_output_message(msg):
+                repaired.append(msg)
+                idx += 1
+                continue
+
+            # assistant with tool_calls
+            if self._is_assistant_with_tool_calls(msg):
+                assistant_call_ids = self._assistant_tool_call_ids_from_message(msg)
+
+                # collect call_ids from immediately following tool messages
+                answered_ids: set[str] = set()
+                tool_msgs: list[Any] = []
+                cursor = idx + 1
+                while cursor < len(messages):
+                    next_msg = messages[cursor]
+                    if not self._is_tool_output_message(next_msg):
+                        break
+                    answered_ids.update(self._tool_result_ids_from_message(next_msg))
+                    tool_msgs.append(next_msg)
+                    cursor += 1
+
+                matched = assistant_call_ids & answered_ids
+                if not matched:
+                    # no matching tool results → drop entire assistant
+                    dropped_calls += len(assistant_call_ids)
+                    idx = cursor
                     continue
-                self._filter_tool_output_parts(msg, valid_ids)
+
+                # keep assistant with only matched tool_calls
+                self._filter_assistant_tool_calls(msg, matched)
+                repaired.append(msg)
+
+                # keep only tool messages that belong to this assistant
+                for tm in tool_msgs:
+                    tm_ids = self._tool_result_ids_from_message(tm)
+                    if tm_ids and (tm_ids & matched):
+                        self._filter_tool_output_parts(tm, matched)
+                        repaired.append(tm)
+                    else:
+                        dropped_outputs += len(tm_ids)
+
+                idx = cursor
+                continue
+
+            # orphan tool message (no preceding assistant with tool_calls)
+            # defer decision to pass 2 — may belong to an assistant earlier in history
             repaired.append(msg)
+            idx += 1
+
+        # ---- pass 2: collect retained assistant call_ids and remove orphan tool messages ----
+        retained_assistant_ids: set[str] = set()
+        for msg in repaired:
+            if self._is_assistant_with_tool_calls(msg):
+                retained_assistant_ids.update(self._assistant_tool_call_ids_from_message(msg))
+
+        if retained_assistant_ids:
+            final: list[Any] = []
+            for msg in repaired:
+                if self._is_tool_output_message(msg):
+                    tm_ids = self._tool_result_ids_from_message(msg)
+                    if tm_ids and not (tm_ids & retained_assistant_ids):
+                        dropped_outputs += len(tm_ids)
+                        continue
+                final.append(msg)
+            repaired = final
 
         if dropped_calls:
             logger.warning(
-                "[LengthErrorHandler] 已移除 %s 个缺少后续 tool 结果的 assistant tool_call，避免 insufficient tool messages 400",
+                "[LengthErrorHandler] 已移除 %s 个无匹配 tool 结果的 assistant tool_call",
                 dropped_calls,
             )
         if dropped_outputs:
             logger.warning(
-                "[LengthErrorHandler] 已移除 %s 条孤立 tool/function 输出消息，避免 No tool call found 400",
+                "[LengthErrorHandler] 已移除 %s 个孤立 tool/function 输出，避免 No tool call found 400",
                 dropped_outputs,
             )
         messages[:] = repaired
         return messages
 
-    def _drop_unanswered_assistant_tool_calls(self, messages: list[Any]) -> int:
-        dropped = 0
-        for index, msg in enumerate(messages):
-            if not isinstance(msg, dict):
+    def _fill_unanswered_assistant_tool_calls(self, messages: list[Any]) -> int:
+        """Insert a stub tool message after every assistant tool_call that is not
+        already followed by a matching tool/function result, so the API always
+        sees a complete call→result pair."""
+        filled_count = 0
+        # Iterate backwards so indices stay stable while inserting.
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if not self._is_assistant_with_tool_calls(msg):
                 continue
             answered_ids = self._following_tool_result_ids(messages, index)
-            dropped += self._filter_assistant_tool_calls(msg, answered_ids)
-        return dropped
+            missing_ids = self._assistant_tool_call_ids_from_message(msg) - answered_ids
+            if not missing_ids:
+                continue
+
+            # Build one stub tool message per missing call_id.
+            stub_parts = []
+            for call_id in sorted(missing_ids):
+                stub_parts.append({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": (
+                        "{\"stub\": true, \"note\": \"工具结果已在早前轮次被上下文压缩移除，"
+                        "此条为自动补填的占位结果，请 LLM 忽略具体内容并基于上下文继续。\"}"
+                    ),
+                })
+            stub_msg: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": next(iter(missing_ids)),
+                "content": stub_parts,
+            }
+            # Insert right after the assistant message.
+            messages.insert(index + 1, stub_msg)
+            filled_count += len(missing_ids)
+
+        return filled_count
+
+    @staticmethod
+    def _is_assistant_with_tool_calls(msg: Any) -> bool:
+        if isinstance(msg, dict):
+            if msg.get("role") != "assistant":
+                return False
+            tool_calls = msg.get("tool_calls")
+            content = msg.get("content")
+        else:
+            if getattr(msg, "role", None) != "assistant":
+                return False
+            tool_calls = getattr(msg, "tool_calls", None)
+            content = getattr(msg, "content", None)
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+        if isinstance(content, list):
+            return any(
+                isinstance(part, dict) and part.get("type") in {"function_call", "tool_use"}
+                for part in content
+            )
+        return False
 
     def _following_tool_result_ids(self, messages: list[Any], index: int) -> set[str]:
         ids: set[str] = set()
@@ -424,7 +530,8 @@ class LengthErrorHandlerPlugin(Star):
 
     def _filter_assistant_tool_calls(self, msg: dict[str, Any], answered_ids: set[str]) -> int:
         dropped = 0
-        tool_calls = msg.get("tool_calls")
+        is_dict = isinstance(msg, dict)
+        tool_calls = msg.get("tool_calls") if is_dict else getattr(msg, "tool_calls", None)
         if isinstance(tool_calls, list):
             kept_tool_calls = []
             for tool_call in tool_calls:
@@ -438,13 +545,27 @@ class LengthErrorHandlerPlugin(Star):
                 else:
                     dropped += 1
             if kept_tool_calls:
-                msg["tool_calls"] = kept_tool_calls
+                if is_dict:
+                    msg["tool_calls"] = kept_tool_calls
+                else:
+                    setattr(msg, "tool_calls", kept_tool_calls)
             elif tool_calls:
-                msg.pop("tool_calls", None)
-                if msg.get("content") is None:
-                    msg["content"] = ""
+                if is_dict:
+                    msg.pop("tool_calls", None)
+                    if msg.get("content") is None:
+                        msg["content"] = ""
+                else:
+                    try:
+                        delattr(msg, "tool_calls")
+                    except AttributeError:
+                        pass
+                    if getattr(msg, "content", None) is None:
+                        try:
+                            setattr(msg, "content", "")
+                        except AttributeError:
+                            pass
 
-        content = msg.get("content")
+        content = msg.get("content") if is_dict else getattr(msg, "content", None)
         if isinstance(content, list):
             filtered_parts = []
             for part in content:
@@ -458,7 +579,13 @@ class LengthErrorHandlerPlugin(Star):
                         dropped += 1
                         continue
                 filtered_parts.append(part)
-            msg["content"] = filtered_parts
+            if is_dict:
+                msg["content"] = filtered_parts
+            else:
+                try:
+                    setattr(msg, "content", filtered_parts)
+                except AttributeError:
+                    pass
         return dropped
 
     def _drop_all_tool_outputs(self, messages: list[Any]) -> list[Any]:
@@ -478,9 +605,8 @@ class LengthErrorHandlerPlugin(Star):
         return messages
 
     def _filter_tool_output_parts(self, msg: Any, valid_ids: set[str]) -> None:
-        if not isinstance(msg, dict):
-            return
-        content = msg.get("content")
+        is_dict = isinstance(msg, dict)
+        content = msg.get("content") if is_dict else getattr(msg, "content", None)
         if not isinstance(content, list):
             return
         filtered = []
@@ -497,28 +623,41 @@ class LengthErrorHandlerPlugin(Star):
                 "[LengthErrorHandler] 已移除 %s 个孤立 function_call_output 内容块",
                 dropped,
             )
-        msg["content"] = filtered
+        if is_dict:
+            msg["content"] = filtered
+        else:
+            try:
+                setattr(msg, "content", filtered)
+            except AttributeError:
+                pass
 
     def _collect_assistant_tool_call_ids(self, messages: Any) -> set[str]:
         ids: set[str] = set()
         if not isinstance(messages, list):
             return ids
         for msg in messages:
-            if isinstance(msg, dict):
-                ids.update(self._assistant_tool_call_ids_from_message(msg))
+            ids.update(self._assistant_tool_call_ids_from_message(msg))
         return ids
 
     def _assistant_tool_call_ids_from_message(self, msg: dict[str, Any]) -> set[str]:
         ids: set[str] = set()
-        tool_calls = msg.get("tool_calls")
+        tool_calls = None
+        content = None
+        if isinstance(msg, dict):
+            tool_calls = msg.get("tool_calls")
+            content = msg.get("content")
+        else:
+            tool_calls = getattr(msg, "tool_calls", None)
+            content = getattr(msg, "content", None)
         if isinstance(tool_calls, list):
             for tool_call in tool_calls:
+                call_id = None
                 if isinstance(tool_call, dict):
                     call_id = tool_call.get("id") or tool_call.get("call_id")
-                    if call_id:
-                        ids.add(str(call_id))
-
-        content = msg.get("content")
+                else:
+                    call_id = getattr(tool_call, "id", None) or getattr(tool_call, "call_id", None)
+                if call_id:
+                    ids.add(str(call_id))
         parts = content if isinstance(content, list) else []
         for part in parts:
             if not isinstance(part, dict):
@@ -540,13 +679,18 @@ class LengthErrorHandlerPlugin(Star):
 
     def _tool_result_ids_from_message(self, msg: Any) -> set[str]:
         ids: set[str] = set()
-        if not isinstance(msg, dict):
-            return ids
-        for key in ("tool_call_id", "call_id"):
-            value = msg.get(key)
-            if value:
-                ids.add(str(value))
-        content = msg.get("content")
+        if isinstance(msg, dict):
+            for key in ("tool_call_id", "call_id", "tool_use_id"):
+                value = msg.get(key)
+                if value:
+                    ids.add(str(value))
+            content = msg.get("content")
+        else:
+            for key in ("tool_call_id", "call_id", "tool_use_id"):
+                value = getattr(msg, key, None)
+                if value:
+                    ids.add(str(value))
+            content = getattr(msg, "content", None)
         parts = content if isinstance(content, list) else []
         for part in parts:
             if isinstance(part, dict) and self._is_tool_output_part(part):
@@ -563,13 +707,18 @@ class LengthErrorHandlerPlugin(Star):
         return ids
 
     def _is_tool_output_message(self, msg: Any) -> bool:
-        if not isinstance(msg, dict):
-            return False
-        if msg.get("role") == "tool":
-            return True
-        if msg.get("type") in {"function_call_output", "tool_result"}:
-            return True
-        content = msg.get("content")
+        if isinstance(msg, dict):
+            if msg.get("role") == "tool":
+                return True
+            if msg.get("type") in {"function_call_output", "tool_result"}:
+                return True
+            content = msg.get("content")
+        else:
+            if getattr(msg, "role", None) == "tool":
+                return True
+            if getattr(msg, "type", None) in {"function_call_output", "tool_result"}:
+                return True
+            content = getattr(msg, "content", None)
         return isinstance(content, list) and any(
             isinstance(part, dict) and self._is_tool_output_part(part) for part in content
         )
