@@ -17,6 +17,36 @@
     "default": 50000,
     "hint": "Provider 发送前兜底压缩阈值。日志中 prompt_tokens 过大时可调低"
   },
+  "hard_token_budget": {
+    "description": "OpenAI Provider 发送前的 messages 硬预算（粗估 tokens）",
+    "type": "int",
+    "default": 32000,
+    "hint": "压缩后仍超过该值会继续裁剪。小上下文模型或 Octopus 上游可调到 24000 左右"
+  },
+  "max_system_chars": {
+    "description": "单条 system 消息保留的最大字符数",
+    "type": "int",
+    "default": 12000,
+    "hint": "用于硬预算裁剪，避免系统提示或压缩摘要过长"
+  },
+  "max_message_chars": {
+    "description": "单条普通消息保留的最大字符数",
+    "type": "int",
+    "default": 6000,
+    "hint": "用于硬预算裁剪，避免单条用户/助手消息过长"
+  },
+  "max_tool_chars": {
+    "description": "单条 tool/function 消息保留的最大字符数",
+    "type": "int",
+    "default": 3000,
+    "hint": "用于硬预算裁剪，避免工具结果把上下文撑爆"
+  },
+  "replace_inline_images_over_chars": {
+    "description": "超过该字符数的内联图片 data URL 会替换为文本占位",
+    "type": "int",
+    "default": 12000,
+    "hint": "用于处理历史中保存的 data:image/...;base64 巨型图片，降低 context_length_exceeded 概率"
+  },
   "keep_recent_rounds": {
     "description": "压缩时保留最近的非 system 消息数",
     "type": "int",
@@ -70,5 +100,11 @@
     "type": "bool",
     "default": true,
     "hint": "可减少 reasoning tokens 吃满输出预算导致正文无法解析的问题"
+  },
+  "sanitize_tool_call_pairs": {
+    "description": "是否修复压缩后的工具调用配对关系",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后会移除孤立 tool 输出，并尽量保留必要 assistant tool_call"
   }
 }

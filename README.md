@@ -7,8 +7,11 @@
 ## 功能特性
 
 - 自动识别 `LengthFinishReasonError`、`finish_reason=length`、`max_tokens` / `max_completion_tokens` 相关截断错误。
+- 自动识别 OpenAI 兼容上游常见的 `context_length_exceeded`、`context window`、`too many tokens` 等上下文超限错误。
 - Runner 层上下文压缩：当对话历史过长时，将较早消息折叠为摘要，只保留最近消息。
 - OpenAI Provider 层兜底 patch：请求发送前检查并修正 payload。
+- Provider 发送前硬预算裁剪：压缩后仍超限时继续收缩单条消息、工具结果和系统提示。
+- 内联图片 data URL 保护：历史里保存的巨型 `data:image/...;base64` 会替换成文本占位，避免单张图片把上下文撑爆。
 - 自动提高输出预算：当 `max_tokens` 或 `max_completion_tokens` 太低时，按配置提升到更安全的值。
 - length 错误自动重试：捕获截断错误后强制压缩 messages，并使用更高输出预算重试一次。
 - reasoning 降档：可将 `reasoning_effort` 调整为 `low`，减少推理 token 挤占正文输出空间。
@@ -26,6 +29,8 @@
 - 模型输出预算太小，导致 response 被截断。
 - reasoning 模型把大量 token 用在推理阶段，正文未完整返回。
 - 多轮工具调用压缩后出现 tool_call / tool_result 配对问题。
+- 上游提示 `context_length_exceeded`，但 AstrBot 日志只看到 `relay stream ended without a terminal result` 或 502。
+- 会话历史里保存了巨型内联图片 base64，导致一次请求达到几十万甚至百万级粗估 tokens。
 - 本地 octopus 或 OpenAI 兼容接口提示 `call_id` 为空或工具调用配对错误。
 
 ## 安装方式
@@ -57,6 +62,11 @@ astrbot_plugin_length_error_handler/
 | `enable_context_compression` | `true` | 是否启用上下文压缩。 |
 | `compression_threshold` | `35000` | Runner 层触发压缩的粗估 token 阈值。 |
 | `provider_compression_threshold` | `50000` | Provider 层发送前触发压缩的粗估 token 阈值。 |
+| `hard_token_budget` | `32000` | Provider 发送前的 messages 硬预算，压缩后仍超出会继续裁剪。 |
+| `max_system_chars` | `12000` | 硬裁剪时单条 system 消息最多保留的字符数。 |
+| `max_message_chars` | `6000` | 硬裁剪时单条普通消息最多保留的字符数。 |
+| `max_tool_chars` | `3000` | 硬裁剪时单条 tool/function 消息最多保留的字符数。 |
+| `replace_inline_images_over_chars` | `12000` | 超过该字符数的内联图片 data URL 会替换为文本占位。 |
 | `keep_recent_rounds` | `4` | 压缩时保留最近的非 system 消息数。 |
 | `summary_max_tokens` | `512` | 摘要最大 token 数，当前作为配置保留。 |
 | `max_older_messages_for_summary` | `20` | 最多取多少条早期消息参与摘要文本构造。 |
@@ -121,7 +131,9 @@ data/plugins_data/length_error_handler/config.json
 4. 根据阈值压缩 `messages`。
 5. 修复 assistant tool_call 与 tool 输出配对。
 6. 移除孤立或没有有效 ID 的工具输出。
-7. 捕获 length 错误后强制压缩并重试一次。
+7. 对压缩后仍超出 `hard_token_budget` 的请求继续做硬裁剪。
+8. 将巨型内联图片 data URL 替换为占位文本。
+9. 捕获 length/context 错误后强制压缩并重试一次。
 
 ## 与 callid_sanitizer 的关系
 
@@ -152,6 +164,7 @@ data/plugins_data/length_error_handler/config.json
 ```yaml
 compression_threshold: 25000
 provider_compression_threshold: 30000
+hard_token_budget: 24000
 keep_recent_rounds: 3
 retry_completion_tokens: 4096
 ```
@@ -166,6 +179,21 @@ enable_provider_patch: true
 ```
 
 并尽量避免多个会改写 messages 的插件同时做激进压缩。
+
+### octopus 上游提示 `context_length_exceeded`
+
+如果上游返回 `Your input exceeds the context window`，而 AstrBot 侧显示 `relay stream ended without a terminal result` 或 502，通常是中继层把真实上下文超限错误包装成了流式 502。
+
+建议先确认插件已更新并重启 AstrBot，然后把小上下文模型的配置调低：
+
+```yaml
+compression_threshold: 24000
+provider_compression_threshold: 24000
+hard_token_budget: 24000
+replace_inline_images_over_chars: 12000
+```
+
+如果旧会话历史里已经保存了大段 `data:image/...;base64`，可以清空该会话上下文或新建会话；新版插件会在后续请求发送前把这类巨型内联图片替换为占位文本。
 
 ## 注意事项
 

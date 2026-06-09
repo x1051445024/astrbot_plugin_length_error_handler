@@ -24,6 +24,11 @@ DEFAULT_CONFIG = {
     "enable_context_compression": True,
     "compression_threshold": 35000,
     "provider_compression_threshold": 50000,
+    "hard_token_budget": 32000,
+    "max_system_chars": 12000,
+    "max_message_chars": 6000,
+    "max_tool_chars": 3000,
+    "replace_inline_images_over_chars": 12000,
     "keep_recent_rounds": 4,
     "summary_max_tokens": 512,
     "max_older_messages_for_summary": 20,
@@ -41,8 +46,8 @@ DEFAULT_CONFIG = {
 @register(
     "astrbot_plugin_length_error_handler",
     "牧濑红莉栖（BOT）",
-    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.6）",
-    "1.0.6",
+    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.7）",
+    "1.0.7",
     "",
 )
 class LengthErrorHandlerPlugin(Star):
@@ -103,17 +108,21 @@ class LengthErrorHandlerPlugin(Star):
         return getattr(ProviderOpenAIOfficial, "_length_error_handler_active_plugin", None)
 
     def _patch_runner(self):
-        marker = "1.0.6"
+        marker = "1.0.7"
         if getattr(ToolLoopAgentRunner, "_length_error_handler_runner_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] Runner v1.0.6 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] Runner v1.0.7 已注入，刷新活动实例")
             return
 
         original_iter = getattr(
             ToolLoopAgentRunner,
             "_length_error_handler_original_iter_v106",
-            ToolLoopAgentRunner._iter_llm_responses_with_fallback,
+            getattr(
+                ToolLoopAgentRunner,
+                "_length_error_handler_original_iter_v107",
+                ToolLoopAgentRunner._iter_llm_responses_with_fallback,
+            ),
         )
-        ToolLoopAgentRunner._length_error_handler_original_iter_v106 = original_iter
+        ToolLoopAgentRunner._length_error_handler_original_iter_v107 = original_iter
 
         async def patched_iter(runner_self, *args, **kwargs):
             plugin = LengthErrorHandlerPlugin._active_from_runner()
@@ -137,7 +146,7 @@ class LengthErrorHandlerPlugin(Star):
         ToolLoopAgentRunner._iter_llm_responses_with_fallback = patched_iter
         ToolLoopAgentRunner._length_error_handler_patched = True
         ToolLoopAgentRunner._length_error_handler_runner_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 Runner v1.0.6")
+        logger.info("[LengthErrorHandler] 已注入 Runner v1.0.7")
 
     def _patch_openai_provider(self):
         if not self.cfg.get("enable_provider_patch", True):
@@ -147,23 +156,31 @@ class LengthErrorHandlerPlugin(Star):
             logger.warning("[LengthErrorHandler] 未找到 ProviderOpenAIOfficial，跳过 Provider patch")
             return
 
-        marker = "1.0.6"
+        marker = "1.0.7"
         if getattr(ProviderOpenAIOfficial, "_length_error_handler_provider_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.6 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.7 已注入，刷新活动实例")
             return
 
         original_query = getattr(
             ProviderOpenAIOfficial,
             "_length_error_handler_original_query_v106",
-            ProviderOpenAIOfficial._query,
+            getattr(
+                ProviderOpenAIOfficial,
+                "_length_error_handler_original_query_v107",
+                ProviderOpenAIOfficial._query,
+            ),
         )
         original_query_stream = getattr(
             ProviderOpenAIOfficial,
             "_length_error_handler_original_query_stream_v106",
-            ProviderOpenAIOfficial._query_stream,
+            getattr(
+                ProviderOpenAIOfficial,
+                "_length_error_handler_original_query_stream_v107",
+                ProviderOpenAIOfficial._query_stream,
+            ),
         )
-        ProviderOpenAIOfficial._length_error_handler_original_query_v106 = original_query
-        ProviderOpenAIOfficial._length_error_handler_original_query_stream_v106 = original_query_stream
+        ProviderOpenAIOfficial._length_error_handler_original_query_v107 = original_query
+        ProviderOpenAIOfficial._length_error_handler_original_query_stream_v107 = original_query_stream
 
         async def patched_query(provider_self, payloads: dict, tools):
             plugin = LengthErrorHandlerPlugin._active_from_provider()
@@ -202,7 +219,7 @@ class LengthErrorHandlerPlugin(Star):
         ProviderOpenAIOfficial._query = patched_query
         ProviderOpenAIOfficial._query_stream = patched_query_stream
         ProviderOpenAIOfficial._length_error_handler_provider_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 OpenAI Provider v1.0.6")
+        logger.info("[LengthErrorHandler] 已注入 OpenAI Provider v1.0.7")
 
     def _is_length_error(self, exc: Exception) -> bool:
         if LengthFinishReasonError is not None and isinstance(exc, LengthFinishReasonError):
@@ -211,6 +228,12 @@ class LengthErrorHandlerPlugin(Star):
         return any(
             pat in text
             for pat in (
+                "context_length_exceeded",
+                "context window",
+                "input exceeds the context",
+                "maximum context length",
+                "too many tokens",
+                "token limit",
                 "lengthfinishreasonerror",
                 "length limit was reached",
                 "finish_reason='length'",
@@ -219,7 +242,7 @@ class LengthErrorHandlerPlugin(Star):
                 "max_completion_tokens",
                 "max_tokens",
             )
-        ) and ("length" in text or "token" in text)
+        ) and ("length" in text or "token" in text or "context" in text)
 
     def _should_retry(self, exc: Exception) -> bool:
         return bool(self.cfg.get("enable_retry_on_length_error", True)) and self._is_length_error(exc)
@@ -230,6 +253,7 @@ class LengthErrorHandlerPlugin(Star):
         self._normalize_reasoning(prepared)
         if self.cfg.get("enable_context_compression", True):
             self._maybe_compress_payload_messages(prepared, force=force_compress)
+        self._enforce_payload_hard_budget(prepared)
         return prepared
 
     def _ensure_payload_budget(self, payloads: dict, retry: bool):
@@ -272,6 +296,7 @@ class LengthErrorHandlerPlugin(Star):
         if len(compressed) < len(messages):
             payloads["messages"] = compressed
             logger.info(f"[LengthErrorHandler] Provider messages 已压缩: {len(messages)} -> {len(compressed)}，估算 tokens≈{estimated}")
+        self._enforce_payload_hard_budget(payloads)
 
     async def _maybe_compress_runner_context(self, runner: Any, force: bool):
         try:
@@ -298,6 +323,7 @@ class LengthErrorHandlerPlugin(Star):
             logger.warning(f"[LengthErrorHandler] Runner 上下文压缩失败: {exc}")
 
     def _compress_messages(self, messages: list[Any], keep_recent: int) -> list[Any]:
+        messages = self._trim_messages_to_char_limits(messages)
         def _get_role(m):
             return m.get("role") if isinstance(m, dict) else getattr(m, "role", None)
         def _get_content(m):
@@ -323,6 +349,158 @@ class LengthErrorHandlerPlugin(Star):
         )[:4000]
         compressed = system_msgs + [{"role": "system", "content": summary}] + protected_recent
         return self._repair_tool_call_pairs(compressed)
+
+    def _enforce_payload_hard_budget(self, payloads: dict):
+        messages = payloads.get("messages")
+        if not isinstance(messages, list):
+            return
+        before = self._estimate_messages_tokens(messages)
+        budget = int(self.cfg.get("hard_token_budget", 32000))
+        if before <= budget:
+            return
+        trimmed = self._trim_messages_to_char_limits(messages)
+        after = self._estimate_messages_tokens(trimmed)
+        if after > budget:
+            keep_recent = max(1, int(self.cfg.get("keep_recent_rounds", 4)) // 2)
+            trimmed = self._compress_messages(trimmed, keep_recent)
+            after = self._estimate_messages_tokens(trimmed)
+        if after > budget:
+            trimmed = self._shrink_messages_to_budget(trimmed, budget)
+            after = self._estimate_messages_tokens(trimmed)
+        payloads["messages"] = trimmed
+        logger.warning(
+            f"[LengthErrorHandler] Provider messages 硬裁剪: tokens≈{before} -> {after}，消息数={len(trimmed)}"
+        )
+
+    def _trim_messages_to_char_limits(self, messages: list[Any]) -> list[Any]:
+        max_system = int(self.cfg.get("max_system_chars", 12000))
+        max_message = int(self.cfg.get("max_message_chars", 6000))
+        max_tool = int(self.cfg.get("max_tool_chars", 3000))
+        return self._trim_messages_with_limits(messages, max_system, max_message, max_tool)
+
+    def _shrink_messages_to_budget(self, messages: list[Any], budget: int) -> list[Any]:
+        max_system = int(self.cfg.get("max_system_chars", 12000))
+        max_message = int(self.cfg.get("max_message_chars", 6000))
+        max_tool = int(self.cfg.get("max_tool_chars", 3000))
+        trimmed = messages
+        for factor in (0.7, 0.5, 0.35, 0.25, 0.15):
+            trimmed = self._trim_messages_with_limits(
+                trimmed,
+                max(1200, int(max_system * factor)),
+                max(800, int(max_message * factor)),
+                max(500, int(max_tool * factor)),
+            )
+            if self._estimate_messages_tokens(trimmed) <= budget:
+                break
+        return self._repair_tool_call_pairs(trimmed)
+
+    def _trim_messages_with_limits(
+        self,
+        messages: list[Any],
+        max_system: int,
+        max_message: int,
+        max_tool: int,
+    ) -> list[Any]:
+        trimmed: list[Any] = []
+        for msg in messages:
+            item = copy.deepcopy(msg)
+            role = self._message_role(item)
+            limit = max_tool if role in {"tool", "function"} else max_message
+            if role == "system":
+                limit = max_system
+            self._trim_message_content(item, limit)
+            trimmed.append(item)
+        return trimmed
+
+    @staticmethod
+    def _message_role(msg: Any) -> str | None:
+        if isinstance(msg, dict):
+            return msg.get("role")
+        return getattr(msg, "role", None)
+
+    def _trim_message_content(self, msg: Any, limit: int) -> None:
+        if limit <= 0:
+            return
+        if isinstance(msg, dict):
+            if "content" in msg:
+                msg["content"] = self._trim_content_value(msg.get("content"), limit)
+            if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
+                for tool_call in msg["tool_calls"]:
+                    if isinstance(tool_call, dict):
+                        func = tool_call.get("function")
+                        if isinstance(func, dict) and isinstance(func.get("arguments"), str):
+                            func["arguments"] = self._truncate_text(func["arguments"], limit)
+            return
+        content = getattr(msg, "content", None)
+        try:
+            setattr(msg, "content", self._trim_content_value(content, limit))
+        except Exception:
+            pass
+
+    def _trim_content_value(self, content: Any, limit: int) -> Any:
+        if isinstance(content, str):
+            return self._truncate_text(content, limit)
+        if isinstance(content, list):
+            trimmed_parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    trimmed_parts.append(self._trim_content_part(part, limit))
+                else:
+                    trimmed_parts.append(self._truncate_text(str(part), limit))
+            return trimmed_parts
+        return content
+
+    def _trim_content_part(self, part: dict[str, Any], limit: int) -> dict[str, Any]:
+        part_copy = copy.deepcopy(part)
+        inline_image = self._inline_image_data_url(part_copy)
+        image_limit = int(self.cfg.get("replace_inline_images_over_chars", 12000))
+        if inline_image and len(inline_image) > image_limit:
+            media_type = inline_image.split(";", 1)[0].removeprefix("data:") or "image"
+            return {
+                "type": "text",
+                "text": (
+                    f"[LengthErrorHandler 已省略内联图片 data URL（{media_type}，约 {len(inline_image)} 字符）；"
+                    "请根据同一消息中的图片路径或调用读图工具读取原图]"
+                ),
+            }
+        for key in ("text", "output", "content"):
+            if isinstance(part_copy.get(key), str):
+                part_copy[key] = self._truncate_text(part_copy[key], limit)
+        return part_copy
+
+    @staticmethod
+    def _inline_image_data_url(part: dict[str, Any]) -> str | None:
+        def _is_data_image(value: Any) -> bool:
+            return isinstance(value, str) and value.startswith("data:image/") and ";base64," in value[:128]
+
+        image_url = part.get("image_url")
+        if isinstance(image_url, dict) and _is_data_image(image_url.get("url")):
+            return image_url["url"]
+        if _is_data_image(image_url):
+            return image_url
+        if _is_data_image(part.get("url")):
+            return part["url"]
+
+        source = part.get("source")
+        if isinstance(source, dict):
+            data = source.get("data")
+            media_type = str(source.get("media_type") or source.get("mime_type") or "")
+            if isinstance(data, str) and len(data) > 12000 and media_type.startswith("image/"):
+                return f"data:{media_type};base64,{data}"
+        return None
+
+    @staticmethod
+    def _truncate_text(text: str, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        keep_head = max(0, limit // 2)
+        keep_tail = max(0, limit - keep_head - 80)
+        omitted = len(text) - keep_head - keep_tail
+        return (
+            text[:keep_head]
+            + f"\n...[LengthErrorHandler 已截断 {omitted} 字符]...\n"
+            + (text[-keep_tail:] if keep_tail else "")
+        )
 
     def _include_required_tool_call_messages(self, older: list[Any], recent: list[Any]) -> list[Any]:
         """Keep assistant tool-call messages needed by retained tool results."""
@@ -845,7 +1023,7 @@ class LengthErrorHandlerPlugin(Star):
     async def test_compression(self, event: AstrMessageEvent):
         c = self.cfg
         yield event.plain_result(
-            f"智能压缩 v1.0.6\n"
+            f"智能压缩 v1.0.7\n"
             f"上下文压缩: {c.get('enable_context_compression')}\n"
             f"Runner 阈值: {c.get('compression_threshold')} tokens\n"
             f"Provider 阈值: {c.get('provider_compression_threshold')} tokens\n"
