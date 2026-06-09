@@ -1,6 +1,7 @@
 import copy
 import json
 import os
+import re
 from datetime import datetime
 from typing import Any
 
@@ -411,13 +412,18 @@ class LengthErrorHandlerPlugin(Star):
         max_tool: int,
     ) -> list[Any]:
         trimmed: list[Any] = []
-        for msg in messages:
+        protected_image_indexes = self._protected_inline_image_indexes(messages)
+        for index, msg in enumerate(messages):
             item = copy.deepcopy(msg)
             role = self._message_role(item)
             limit = max_tool if role in {"tool", "function"} else max_message
             if role == "system":
                 limit = max_system
-            self._trim_message_content(item, limit)
+            self._trim_message_content(
+                item,
+                limit,
+                preserve_inline_images=index in protected_image_indexes,
+            )
             trimmed.append(item)
         return trimmed
 
@@ -427,12 +433,21 @@ class LengthErrorHandlerPlugin(Star):
             return msg.get("role")
         return getattr(msg, "role", None)
 
-    def _trim_message_content(self, msg: Any, limit: int) -> None:
+    def _trim_message_content(
+        self,
+        msg: Any,
+        limit: int,
+        preserve_inline_images: bool = False,
+    ) -> None:
         if limit <= 0:
             return
         if isinstance(msg, dict):
             if "content" in msg:
-                msg["content"] = self._trim_content_value(msg.get("content"), limit)
+                msg["content"] = self._trim_content_value(
+                    msg.get("content"),
+                    limit,
+                    preserve_inline_images=preserve_inline_images,
+                )
             if "tool_calls" in msg and isinstance(msg["tool_calls"], list):
                 for tool_call in msg["tool_calls"]:
                     if isinstance(tool_call, dict):
@@ -442,26 +457,55 @@ class LengthErrorHandlerPlugin(Star):
             return
         content = getattr(msg, "content", None)
         try:
-            setattr(msg, "content", self._trim_content_value(content, limit))
+            setattr(
+                msg,
+                "content",
+                self._trim_content_value(
+                    content,
+                    limit,
+                    preserve_inline_images=preserve_inline_images,
+                ),
+            )
         except Exception:
             pass
 
-    def _trim_content_value(self, content: Any, limit: int) -> Any:
+    def _trim_content_value(
+        self,
+        content: Any,
+        limit: int,
+        preserve_inline_images: bool = False,
+    ) -> Any:
         if isinstance(content, str):
             return self._truncate_text(content, limit)
         if hasattr(content, "model_dump_for_context"):
             try:
-                return self._trim_content_part(content.model_dump_for_context(), limit)
+                return self._trim_content_part(
+                    content.model_dump_for_context(),
+                    limit,
+                    preserve_inline_images=preserve_inline_images,
+                )
             except Exception:
                 return self._truncate_text(str(content), limit)
         if isinstance(content, list):
             trimmed_parts = []
             for part in content:
                 if isinstance(part, dict):
-                    trimmed_parts.append(self._trim_content_part(part, limit))
+                    trimmed_parts.append(
+                        self._trim_content_part(
+                            part,
+                            limit,
+                            preserve_inline_images=preserve_inline_images,
+                        )
+                    )
                 elif hasattr(part, "model_dump_for_context"):
                     try:
-                        trimmed_parts.append(self._trim_content_part(part.model_dump_for_context(), limit))
+                        trimmed_parts.append(
+                            self._trim_content_part(
+                                part.model_dump_for_context(),
+                                limit,
+                                preserve_inline_images=preserve_inline_images,
+                            )
+                        )
                     except Exception:
                         trimmed_parts.append(self._truncate_text(str(part), limit))
                 else:
@@ -469,10 +513,49 @@ class LengthErrorHandlerPlugin(Star):
             return trimmed_parts
         return content
 
-    def _trim_content_part(self, part: dict[str, Any], limit: int) -> dict[str, Any]:
+    def _protected_inline_image_indexes(self, messages: list[Any]) -> set[int]:
+        protected: set[int] = set()
+        for index in range(len(messages) - 1, -1, -1):
+            msg = messages[index]
+            if self._message_role(msg) != "user":
+                continue
+            if self._message_has_inline_image(msg):
+                protected.add(index)
+                break
+        return protected
+
+    def _message_has_inline_image(self, msg: Any) -> bool:
+        if isinstance(msg, dict):
+            content = msg.get("content")
+        else:
+            content = getattr(msg, "content", None)
+        return self._content_has_inline_image(content)
+
+    def _content_has_inline_image(self, content: Any) -> bool:
+        if hasattr(content, "model_dump_for_context"):
+            try:
+                content = content.model_dump_for_context()
+            except Exception:
+                return False
+        if isinstance(content, dict):
+            if self._inline_image_data_url(content):
+                return True
+            return any(self._content_has_inline_image(value) for value in content.values())
+        if isinstance(content, list):
+            return any(self._content_has_inline_image(item) for item in content)
+        return isinstance(content, str) and content.startswith("data:image/") and ";base64," in content[:128]
+
+    def _trim_content_part(
+        self,
+        part: dict[str, Any],
+        limit: int,
+        preserve_inline_images: bool = False,
+    ) -> dict[str, Any]:
         part_copy = copy.deepcopy(part)
         inline_image = self._inline_image_data_url(part_copy)
         image_limit = int(self.cfg.get("replace_inline_images_over_chars", 12000))
+        if inline_image and preserve_inline_images:
+            return part_copy
         if inline_image and len(inline_image) > image_limit:
             media_type = inline_image.split(";", 1)[0].removeprefix("data:") or "image"
             return {
@@ -931,12 +1014,31 @@ class LengthErrorHandlerPlugin(Star):
     def _is_tool_call_part(part: dict[str, Any]) -> bool:
         return part.get("type") in {"function_call", "tool_use"}
 
-    @staticmethod
-    def _estimate_messages_tokens(messages: list[Any]) -> int:
+    def _estimate_messages_tokens(self, messages: list[Any]) -> int:
+        protected_image_indexes = self._protected_inline_image_indexes(messages)
         try:
-            return len(json.dumps(messages, ensure_ascii=False, default=str)) // 4
+            total_chars = 0
+            for index, msg in enumerate(messages):
+                text = json.dumps(msg, ensure_ascii=False, default=str)
+                if index in protected_image_indexes:
+                    text = self._compact_inline_image_data_urls(text)
+                total_chars += len(text)
+            return total_chars // 4
         except Exception:
             return len(str(messages)) // 4
+
+    @staticmethod
+    def _compact_inline_image_data_urls(text: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            header = match.group(1)
+            data = match.group(2)
+            return f"{header}[inline image omitted for token estimate; chars={len(data)}]"
+
+        return re.sub(
+            r"(data:image/[^;\"'\s]+;base64,)([A-Za-z0-9+/=\r\n]+)",
+            _replace,
+            text,
+        )
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
