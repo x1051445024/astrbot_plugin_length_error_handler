@@ -46,8 +46,8 @@ DEFAULT_CONFIG = {
 @register(
     "astrbot_plugin_length_error_handler",
     "牧濑红莉栖（BOT）",
-    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.7）",
-    "1.0.7",
+    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.8）",
+    "1.0.8",
     "",
 )
 class LengthErrorHandlerPlugin(Star):
@@ -108,9 +108,9 @@ class LengthErrorHandlerPlugin(Star):
         return getattr(ProviderOpenAIOfficial, "_length_error_handler_active_plugin", None)
 
     def _patch_runner(self):
-        marker = "1.0.7"
+        marker = "1.0.8"
         if getattr(ToolLoopAgentRunner, "_length_error_handler_runner_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] Runner v1.0.7 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] Runner v1.0.8 已注入，刷新活动实例")
             return
 
         original_iter = getattr(
@@ -146,7 +146,7 @@ class LengthErrorHandlerPlugin(Star):
         ToolLoopAgentRunner._iter_llm_responses_with_fallback = patched_iter
         ToolLoopAgentRunner._length_error_handler_patched = True
         ToolLoopAgentRunner._length_error_handler_runner_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 Runner v1.0.7")
+        logger.info("[LengthErrorHandler] 已注入 Runner v1.0.8")
 
     def _patch_openai_provider(self):
         if not self.cfg.get("enable_provider_patch", True):
@@ -156,9 +156,9 @@ class LengthErrorHandlerPlugin(Star):
             logger.warning("[LengthErrorHandler] 未找到 ProviderOpenAIOfficial，跳过 Provider patch")
             return
 
-        marker = "1.0.7"
+        marker = "1.0.8"
         if getattr(ProviderOpenAIOfficial, "_length_error_handler_provider_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.7 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.8 已注入，刷新活动实例")
             return
 
         original_query = getattr(
@@ -219,7 +219,7 @@ class LengthErrorHandlerPlugin(Star):
         ProviderOpenAIOfficial._query = patched_query
         ProviderOpenAIOfficial._query_stream = patched_query_stream
         ProviderOpenAIOfficial._length_error_handler_provider_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 OpenAI Provider v1.0.7")
+        logger.info("[LengthErrorHandler] 已注入 OpenAI Provider v1.0.8")
 
     def _is_length_error(self, exc: Exception) -> bool:
         if LengthFinishReasonError is not None and isinstance(exc, LengthFinishReasonError):
@@ -251,9 +251,11 @@ class LengthErrorHandlerPlugin(Star):
         prepared = copy.deepcopy(payloads)
         self._ensure_payload_budget(prepared, retry=retry)
         self._normalize_reasoning(prepared)
+        self._sanitize_payload_messages(prepared)
         if self.cfg.get("enable_context_compression", True):
             self._maybe_compress_payload_messages(prepared, force=force_compress)
         self._enforce_payload_hard_budget(prepared)
+        self._sanitize_payload_messages(prepared)
         return prepared
 
     def _ensure_payload_budget(self, payloads: dict, retry: bool):
@@ -357,6 +359,7 @@ class LengthErrorHandlerPlugin(Star):
         before = self._estimate_messages_tokens(messages)
         budget = int(self.cfg.get("hard_token_budget", 32000))
         if before <= budget:
+            self._sanitize_payload_messages(payloads)
             return
         trimmed = self._trim_messages_to_char_limits(messages)
         after = self._estimate_messages_tokens(trimmed)
@@ -367,10 +370,16 @@ class LengthErrorHandlerPlugin(Star):
         if after > budget:
             trimmed = self._shrink_messages_to_budget(trimmed, budget)
             after = self._estimate_messages_tokens(trimmed)
-        payloads["messages"] = trimmed
+        payloads["messages"] = self._repair_tool_call_pairs(trimmed)
         logger.warning(
-            f"[LengthErrorHandler] Provider messages 硬裁剪: tokens≈{before} -> {after}，消息数={len(trimmed)}"
+            f"[LengthErrorHandler] Provider messages 硬裁剪: tokens≈{before} -> {after}，消息数={len(payloads['messages'])}"
         )
+
+    def _sanitize_payload_messages(self, payloads: dict) -> None:
+        messages = payloads.get("messages")
+        if not isinstance(messages, list):
+            return
+        payloads["messages"] = self._repair_tool_call_pairs(messages)
 
     def _trim_messages_to_char_limits(self, messages: list[Any]) -> list[Any]:
         max_system = int(self.cfg.get("max_system_chars", 12000))
@@ -440,11 +449,21 @@ class LengthErrorHandlerPlugin(Star):
     def _trim_content_value(self, content: Any, limit: int) -> Any:
         if isinstance(content, str):
             return self._truncate_text(content, limit)
+        if hasattr(content, "model_dump_for_context"):
+            try:
+                return self._trim_content_part(content.model_dump_for_context(), limit)
+            except Exception:
+                return self._truncate_text(str(content), limit)
         if isinstance(content, list):
             trimmed_parts = []
             for part in content:
                 if isinstance(part, dict):
                     trimmed_parts.append(self._trim_content_part(part, limit))
+                elif hasattr(part, "model_dump_for_context"):
+                    try:
+                        trimmed_parts.append(self._trim_content_part(part.model_dump_for_context(), limit))
+                    except Exception:
+                        trimmed_parts.append(self._truncate_text(str(part), limit))
                 else:
                     trimmed_parts.append(self._truncate_text(str(part), limit))
             return trimmed_parts
@@ -623,6 +642,10 @@ class LengthErrorHandlerPlugin(Star):
                         continue
                 final.append(msg)
             repaired = final
+        else:
+            before_drop = len(repaired)
+            repaired = self._drop_all_tool_outputs(repaired)
+            dropped_outputs += before_drop - len(repaired)
 
         if dropped_calls:
             logger.warning(
@@ -652,25 +675,20 @@ class LengthErrorHandlerPlugin(Star):
             if not missing_ids:
                 continue
 
-            # Build one stub tool message per missing call_id.
-            stub_parts = []
             for call_id in sorted(missing_ids):
-                stub_parts.append({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": (
-                        "{\"stub\": true, \"note\": \"工具结果已在早前轮次被上下文压缩移除，"
-                        "此条为自动补填的占位结果，请 LLM 忽略具体内容并基于上下文继续。\"}"
+                stub_msg: dict[str, Any] = {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": json.dumps(
+                        {
+                            "stub": True,
+                            "note": "工具结果已在早前轮次被上下文压缩移除，此条为自动补填的占位结果，请忽略具体内容并基于上下文继续。",
+                        },
+                        ensure_ascii=False,
                     ),
-                })
-            stub_msg: dict[str, Any] = {
-                "role": "tool",
-                "tool_call_id": next(iter(missing_ids)),
-                "content": stub_parts,
-            }
-            # Insert right after the assistant message.
-            messages.insert(index + 1, stub_msg)
-            filled_count += len(missing_ids)
+                }
+                messages.insert(index + 1, stub_msg)
+                filled_count += 1
 
         return filled_count
 
@@ -926,12 +944,27 @@ class LengthErrorHandlerPlugin(Star):
             return ""
         if isinstance(content, str):
             return " ".join(content.split())
+        if hasattr(content, "model_dump_for_context"):
+            try:
+                content = content.model_dump_for_context()
+            except Exception:
+                return " ".join(str(content).split())
         if isinstance(content, list):
             parts = []
             for item in content:
+                if hasattr(item, "model_dump_for_context"):
+                    try:
+                        item = item.model_dump_for_context()
+                    except Exception:
+                        parts.append(str(item))
+                        continue
                 if isinstance(item, dict):
                     if item.get("type") == "text":
                         parts.append(str(item.get("text", "")))
+                    elif item.get("type") == "image_url":
+                        image_url = item.get("image_url")
+                        image_id = image_url.get("id") if isinstance(image_url, dict) else None
+                        parts.append(f"[image_url:{image_id or 'image'}]")
                     elif "text" in item:
                         parts.append(str(item.get("text", "")))
                     elif item.get("type"):
@@ -1023,7 +1056,7 @@ class LengthErrorHandlerPlugin(Star):
     async def test_compression(self, event: AstrMessageEvent):
         c = self.cfg
         yield event.plain_result(
-            f"智能压缩 v1.0.7\n"
+            f"智能压缩 v1.0.8\n"
             f"上下文压缩: {c.get('enable_context_compression')}\n"
             f"Runner 阈值: {c.get('compression_threshold')} tokens\n"
             f"Provider 阈值: {c.get('provider_compression_threshold')} tokens\n"

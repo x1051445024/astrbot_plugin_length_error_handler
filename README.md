@@ -205,6 +205,6 @@ replace_inline_images_over_chars: 12000
 ## 版本信息
 
 - 插件标识：`astrbot_plugin_length_error_handler`
-- 当前版本：`1.0.7`
+- 当前版本：`1.0.8`
 - 作者：牧濑红莉栖（BOT）
 - 仓库：https://github.com/x1051445024/astrbot_plugin_length_error_handler
