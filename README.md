@@ -13,12 +13,14 @@
 - Provider 发送前硬预算裁剪：压缩后仍超限时继续收缩单条消息、工具结果和系统提示。
 - 内联图片 data URL 保护：历史里保存的巨型 `data:image/...;base64` 会替换成文本占位，避免单张图片把上下文撑爆。
 - 自动提高输出预算：当 `max_tokens` 或 `max_completion_tokens` 太低时，按配置提升到更安全的值。
-- length 错误自动重试：捕获截断错误后强制压缩 messages，并使用更高输出预算重试一次。
+- length 错误自动重试：捕获截断错误后强制压缩 messages，并使用更高输出预算重试。支持通过 `max_retry_count` 配置最大重试次数，避免与核心 fallback 叠乘。
 - reasoning 降档：可将 `reasoning_effort` 调整为 `low`，减少推理 token 挤占正文输出空间。
 - 工具调用配对修复：压缩上下文时尽量保留必要的 assistant tool_call 与 tool 输出配对，清理孤立输出。
 - 空 ID 防护：过滤没有有效 `call_id` / `tool_call_id` 的工具输出，避免上游返回 `empty string` 400。
 - 错误日志记录：记录 length error 出现次数、阶段、模型和 token 使用信息，方便排障。
 - 支持 AstrBot WebUI 配置。
+- **性能优化**：小上下文请求自动走快速路径，跳过 deepcopy 和 json.dumps 估算，降低 CPU 开销。
+- **防御性容错**：插件预处理逻辑出错时自动降级为原始请求，不中断用户对话。
 
 ## 适用场景
 
@@ -60,7 +62,7 @@ astrbot_plugin_length_error_handler/
 | 配置项 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `enable_context_compression` | `true` | 是否启用上下文压缩。 |
-| `compression_threshold` | `35000` | Runner 层触发压缩的粗估 token 阈值。 |
+| `compression_threshold` | `30000` | Runner 层触发压缩的粗估 token 阈值。 |
 | `provider_compression_threshold` | `50000` | Provider 层发送前触发压缩的粗估 token 阈值。 |
 | `hard_token_budget` | `32000` | Provider 发送前的 messages 硬预算，压缩后仍超出会继续裁剪。 |
 | `max_system_chars` | `12000` | 硬裁剪时单条 system 消息最多保留的字符数。 |
@@ -68,15 +70,16 @@ astrbot_plugin_length_error_handler/
 | `max_tool_chars` | `3000` | 硬裁剪时单条 tool/function 消息最多保留的字符数。 |
 | `replace_inline_images_over_chars` | `12000` | 超过该字符数的内联图片 data URL 会替换为文本占位。 |
 | `keep_recent_rounds` | `4` | 压缩时保留最近的非 system 消息数。 |
-| `summary_max_tokens` | `512` | 摘要最大 token 数，当前作为配置保留。 |
+| `summary_max_tokens` | `1024` | 摘要最大 token 数，当前作为配置保留。 |
 | `max_older_messages_for_summary` | `20` | 最多取多少条早期消息参与摘要文本构造。 |
 | `enable_learning` | `true` | 是否记录 length error 日志。 |
 | `enable_provider_patch` | `true` | 是否启用 OpenAI Provider 层兜底 patch。 |
-| `enable_retry_on_length_error` | `true` | 捕获 length 错误后是否自动重试一次。 |
-| `min_completion_tokens` | `2048` | 正常请求的最小输出 token 预算。 |
-| `retry_completion_tokens` | `4096` | length 错误重试时使用的输出 token 预算。 |
-| `force_reasoning_effort_low` | `true` | 是否将 `reasoning_effort` 降为 `low`。 |
+| `enable_retry_on_length_error` | `true` | 捕获 length 错误后是否自动重试。 |
+| `min_completion_tokens` | `512` | 正常请求的最小输出 token 预算。 |
+| `retry_completion_tokens` | `8192` | length 错误重试时使用的输出 token 预算。 |
+| `force_reasoning_effort_low` | `false` | 是否将 `reasoning_effort` 降为 `low`。默认关闭，不全局降级推理质量。 |
 | `sanitize_tool_call_pairs` | `true` | 是否修复压缩后的工具调用配对关系。 |
+| `max_retry_count` | `1` | 同一 length 错误的最大重试次数。默认 1 次，超出后交给 AstrBot 核心 fallback。 |
 
 如果没有从 WebUI 读取到配置，插件会尝试在以下位置生成本地配置文件：
 
@@ -117,9 +120,11 @@ data/plugins_data/length_error_handler/config.json
 插件会 patch `ToolLoopAgentRunner._iter_llm_responses_with_fallback`：
 
 1. 请求前按阈值检查上下文长度。
-2. 超阈值时将旧消息折叠为摘要，保留最近消息。
-3. 捕获 length 截断错误时记录日志。
-4. 强制压缩上下文、提高输出预算后重试一次。
+2. 小上下文请求走快速路径（跳过 deepcopy + json.dumps），降低 CPU 开销。
+3. 超阈值时将旧消息折叠为摘要，保留最近消息。
+4. 捕获 length 截断错误时记录日志。
+5. 强制压缩上下文、提高输出预算后重试（受 `max_retry_count` 限制）。
+6. 预处理出错时自动降级为原始请求，不中断用户对话。
 
 ### OpenAI Provider 层
 
@@ -133,7 +138,8 @@ data/plugins_data/length_error_handler/config.json
 6. 移除孤立或没有有效 ID 的工具输出。
 7. 对压缩后仍超出 `hard_token_budget` 的请求继续做硬裁剪。
 8. 将巨型内联图片 data URL 替换为占位文本。
-9. 捕获 length/context 错误后强制压缩并重试一次。
+9. 捕获 length/context 错误后强制压缩并重试（受 `max_retry_count` 限制）。
+10. 预处理出错时自动降级为原始请求，不中断用户对话。
 
 ## 与 callid_sanitizer 的关系
 
@@ -205,6 +211,27 @@ replace_inline_images_over_chars: 12000
 ## 版本信息
 
 - 插件标识：`astrbot_plugin_length_error_handler`
-- 当前版本：`1.0.8`
+- 当前版本：`1.0.9`
 - 作者：牧濑红莉栖（BOT）
 - 仓库：https://github.com/x1051445024/astrbot_plugin_length_error_handler
+
+## 更新日志
+
+### v1.0.9
+
+**性能优化：**
+- 小上下文请求自动走快速路径，跳过 deepcopy 和 json.dumps 估算，降低 CPU 开销。
+- 新增 `_quick_estimate_chars` 和 `_content_char_len` 轻量估算方法。
+
+**防御性容错：**
+- 三个 patched 函数（Runner 层 `patched_iter`、Provider 层 `patched_query` 和 `patched_query_stream`）的预处理逻辑加了 try/except 防御。
+- 预处理出错时自动降级为原始请求，插件逻辑出错不中断用户对话。
+
+**重试控制：**
+- 新增 `max_retry_count` 配置项（默认 1），同一 length 错误最多由本插件重试指定次数。
+- 超出重试上限后干净地交给 AstrBot 核心 fallback 机制，避免多层重试叠加。
+
+**其他改进：**
+- `force_reasoning_effort_low` 默认值改为 `false`，不再全局降级推理模型质量。
+- `_is_length_error` 收紧匹配逻辑，减少误判中转 API 参数校验错误为 length 截断。
+- `_ensure_runner_budget` 只在 retry 时修改配置，避免正常请求的副作用残留。
