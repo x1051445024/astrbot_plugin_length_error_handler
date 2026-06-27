@@ -106,5 +106,11 @@
     "type": "bool",
     "default": true,
     "hint": "开启后会移除孤立 tool 输出，并尽量保留必要 assistant tool_call"
+  },
+  "max_retry_count": {
+    "description": "同一 length 错误的最大重试次数，避免与核心 fallback 叠乘",
+    "type": "int",
+    "default": 1,
+    "hint": "默认 1，即每个 length 截断错误最多由本插件重试一次，超出后交给 AstrBot 核心 fallback 机制"
   }
 }

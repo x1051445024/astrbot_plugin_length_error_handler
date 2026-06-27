@@ -38,8 +38,9 @@ DEFAULT_CONFIG = {
     "enable_retry_on_length_error": True,
     "min_completion_tokens": 2048,
     "retry_completion_tokens": 4096,
-    "force_reasoning_effort_low": True,
+    "force_reasoning_effort_low": False,
     "sanitize_tool_call_pairs": True,
+    "max_retry_count": 1,
     "summary_prompt_prefix": "请用简洁的中文（200字以内）总结以下多轮对话的关键信息、决策和上下文，不要添加主观评价，只保留事实：\n\n",
 }
 
@@ -47,8 +48,8 @@ DEFAULT_CONFIG = {
 @register(
     "astrbot_plugin_length_error_handler",
     "牧濑红莉栖（BOT）",
-    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.8）",
-    "1.0.8",
+    "自动处理 LengthFinishReasonError + 输出预算修正 + Provider 兜底重试（1.0.9）",
+    "1.0.9",
     "",
 )
 class LengthErrorHandlerPlugin(Star):
@@ -59,6 +60,7 @@ class LengthErrorHandlerPlugin(Star):
         self.error_log_path = os.path.join(self.log_dir, "length_error.jsonl")
         self.config_path = os.path.join(self.log_dir, "config.json")
         self.cfg = self._load_config(context)
+        self._retry_counters: dict[int, int] = {}
         self._activate()
         self._patch_runner()
         self._patch_openai_provider()
@@ -109,9 +111,9 @@ class LengthErrorHandlerPlugin(Star):
         return getattr(ProviderOpenAIOfficial, "_length_error_handler_active_plugin", None)
 
     def _patch_runner(self):
-        marker = "1.0.8"
+        marker = "1.0.9"
         if getattr(ToolLoopAgentRunner, "_length_error_handler_runner_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] Runner v1.0.8 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] Runner v1.0.9 已注入，刷新活动实例")
             return
 
         original_iter = getattr(
@@ -127,9 +129,13 @@ class LengthErrorHandlerPlugin(Star):
 
         async def patched_iter(runner_self, *args, **kwargs):
             plugin = LengthErrorHandlerPlugin._active_from_runner()
+            # 优化B: 正常路径的预处理包在 try 里，失败则降级为直接调用原函数
             if plugin is not None:
-                await plugin._maybe_compress_runner_context(runner_self, force=False)
-                plugin._ensure_runner_budget(runner_self, retry=False)
+                try:
+                    await plugin._maybe_compress_runner_context(runner_self, force=False)
+                    plugin._ensure_runner_budget(runner_self, retry=False)
+                except Exception as exc_prep:
+                    logger.warning(f"[LengthErrorHandler] runner 预处理失败，降级直跑原函数: {exc_prep}")
             try:
                 async for resp in original_iter(runner_self, *args, **kwargs):
                     yield resp
@@ -137,17 +143,21 @@ class LengthErrorHandlerPlugin(Star):
                 plugin = LengthErrorHandlerPlugin._active_from_runner()
                 if plugin is None or not plugin._is_length_error(exc):
                     raise
+                if plugin._retry_budget_exceeded(exc):
+                    logger.warning("[LengthErrorHandler] Runner length 重试已达上限(max_retry_count)，交给核心 fallback")
+                    raise
                 logger.warning("[LengthErrorHandler] Runner 捕获 length 截断，压缩并扩大输出预算后重试")
-                plugin._log_error(exc, runner_self, "runner")
-                plugin._ensure_runner_budget(runner_self, retry=True)
-                await plugin._maybe_compress_runner_context(runner_self, force=True)
+                # 优化B: 重试路径也包 try，失败则抛原异常，不吞错
+                try:
+                    plugin._log_error(exc, runner_self, "runner")
+                    plugin._ensure_runner_budget(runner_self, retry=True)
+                    await plugin._maybe_compress_runner_context(runner_self, force=True)
+                except Exception as exc_retry_prep:
+                    logger.warning(f"[LengthErrorHandler] runner 重试预处理失败: {exc_retry_prep}")
+                    raise
                 async for resp in original_iter(runner_self, *args, **kwargs):
                     yield resp
-
-        ToolLoopAgentRunner._iter_llm_responses_with_fallback = patched_iter
-        ToolLoopAgentRunner._length_error_handler_patched = True
-        ToolLoopAgentRunner._length_error_handler_runner_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 Runner v1.0.8")
+                plugin._clear_retry_counter(exc)
 
     def _patch_openai_provider(self):
         if not self.cfg.get("enable_provider_patch", True):
@@ -157,9 +167,9 @@ class LengthErrorHandlerPlugin(Star):
             logger.warning("[LengthErrorHandler] 未找到 ProviderOpenAIOfficial，跳过 Provider patch")
             return
 
-        marker = "1.0.8"
+        marker = "1.0.9"
         if getattr(ProviderOpenAIOfficial, "_length_error_handler_provider_patch_version", None) == marker:
-            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.8 已注入，刷新活动实例")
+            logger.info("[LengthErrorHandler] OpenAI Provider v1.0.9 已注入，刷新活动实例")
             return
 
         original_query = getattr(
@@ -187,16 +197,31 @@ class LengthErrorHandlerPlugin(Star):
             plugin = LengthErrorHandlerPlugin._active_from_provider()
             if plugin is None:
                 return await original_query(provider_self, payloads, tools)
-            first_payload = plugin._prepare_payload(payloads, retry=False, force_compress=False)
+            # 优化B: _prepare_payload 失败则降级为直接用原始 payloads
+            try:
+                first_payload = plugin._prepare_payload(payloads, retry=False, force_compress=False)
+            except Exception as exc_prep:
+                logger.warning(f"[LengthErrorHandler] provider_query 预处理失败，用原始 payloads: {exc_prep}")
+                first_payload = payloads
             try:
                 return await original_query(provider_self, first_payload, tools)
             except Exception as exc:
                 if not plugin._should_retry(exc):
                     raise
+                if plugin._retry_budget_exceeded(exc):
+                    logger.warning("[LengthErrorHandler] provider_query length 重试已达上限(max_retry_count)，交给核心 fallback")
+                    raise
                 logger.warning("[LengthErrorHandler] OpenAI Provider 捕获 length 截断，压缩 messages + 扩大输出预算后重试")
                 plugin._log_error(exc, provider_self, "provider_query")
-                retry_payload = plugin._prepare_payload(payloads, retry=True, force_compress=True)
-                return await original_query(provider_self, retry_payload, tools)
+                # 优化B: 重试路径也包 try，失败则抛原异常，不吞错
+                try:
+                    retry_payload = plugin._prepare_payload(payloads, retry=True, force_compress=True)
+                except Exception as exc_retry_prep:
+                    logger.warning(f"[LengthErrorHandler] provider_query 重试预处理失败: {exc_retry_prep}")
+                    raise
+                result = await original_query(provider_self, retry_payload, tools)
+                plugin._clear_retry_counter(exc)
+                return result
 
         async def patched_query_stream(provider_self, payloads: dict, tools):
             plugin = LengthErrorHandlerPlugin._active_from_provider()
@@ -204,51 +229,92 @@ class LengthErrorHandlerPlugin(Star):
                 async for resp in original_query_stream(provider_self, payloads, tools):
                     yield resp
                 return
-            first_payload = plugin._prepare_payload(payloads, retry=False, force_compress=False)
+            # 优化B: _prepare_payload 失败则降级为直接用原始 payloads
+            try:
+                first_payload = plugin._prepare_payload(payloads, retry=False, force_compress=False)
+            except Exception as exc_prep:
+                logger.warning(f"[LengthErrorHandler] provider_stream 预处理失败，用原始 payloads: {exc_prep}")
+                first_payload = payloads
             try:
                 async for resp in original_query_stream(provider_self, first_payload, tools):
                     yield resp
             except Exception as exc:
                 if not plugin._should_retry(exc):
                     raise
+                if plugin._retry_budget_exceeded(exc):
+                    logger.warning("[LengthErrorHandler] provider_stream length 重试已达上限(max_retry_count)，交给核心 fallback")
+                    raise
                 logger.warning("[LengthErrorHandler] OpenAI Provider Stream 捕获 length 截断，压缩 messages + 扩大输出预算后重试")
                 plugin._log_error(exc, provider_self, "provider_stream")
-                retry_payload = plugin._prepare_payload(payloads, retry=True, force_compress=True)
+                # 优化B: 重试路径也包 try，失败则抛原异常，不吞错
+                try:
+                    retry_payload = plugin._prepare_payload(payloads, retry=True, force_compress=True)
+                except Exception as exc_retry_prep:
+                    logger.warning(f"[LengthErrorHandler] provider_stream 重试预处理失败: {exc_retry_prep}")
+                    raise
                 async for resp in original_query_stream(provider_self, retry_payload, tools):
                     yield resp
-
-        ProviderOpenAIOfficial._query = patched_query
-        ProviderOpenAIOfficial._query_stream = patched_query_stream
-        ProviderOpenAIOfficial._length_error_handler_provider_patch_version = marker
-        logger.info("[LengthErrorHandler] 已注入 OpenAI Provider v1.0.8")
+                plugin._clear_retry_counter(exc)
 
     def _is_length_error(self, exc: Exception) -> bool:
+        # 优化: 优先用 SDK 的强类型判断，最可靠。
         if LengthFinishReasonError is not None and isinstance(exc, LengthFinishReasonError):
             return True
         text = f"{type(exc).__name__}: {exc}".lower()
-        return any(
-            pat in text
-            for pat in (
-                "context_length_exceeded",
-                "context window",
-                "input exceeds the context",
-                "maximum context length",
-                "too many tokens",
-                "token limit",
-                "lengthfinishreasonerror",
-                "length limit was reached",
-                "finish_reason='length'",
-                'finish_reason="length"',
-                "finish reason length",
-                "max_completion_tokens",
-                "max_tokens",
-            )
-        ) and ("length" in text or "token" in text or "context" in text)
+        # 优化: 必须命中明确的 finish_reason=length 信号，避免把中转 API 的
+        # "max_tokens parameter is invalid" 之类参数校验错误误判成 length 截断。
+        strong_signals = (
+            "context_length_exceeded",
+            "context window",
+            "input exceeds the context",
+            "maximum context length",
+            "lengthfinishreasonerror",
+            "length limit was reached",
+            "finish_reason='length'",
+            'finish_reason="length"',
+            "finish reason length",
+            "too many tokens",
+            "token limit",
+        )
+        if not any(pat in text for pat in strong_signals):
+            return False
+        # 优化: 二次确认必须出现 length/token/context 之一，进一步收紧
+        return ("length" in text or "token" in text or "context" in text)
+
+    def _retry_budget_exceeded(self, exc: Exception) -> bool:
+        # 优化C: 按异常对象 id 追踪该请求已重试次数，防止与核心 fallback 叠乘。
+        # max_retry_count 默认 1：同一 length 错误最多重试一次。
+        key = id(exc)
+        count = self._retry_counters.get(key, 0)
+        limit = int(self.cfg.get("max_retry_count", 1))
+        if count >= limit:
+            self._retry_counters.pop(key, None)
+            return True
+        self._retry_counters[key] = count + 1
+        return False
+
+    def _clear_retry_counter(self, exc: Exception) -> None:
+        self._retry_counters.pop(id(exc), None)
 
     def _should_retry(self, exc: Exception) -> bool:
         return bool(self.cfg.get("enable_retry_on_length_error", True)) and self._is_length_error(exc)
 
     def _prepare_payload(self, payloads: dict, retry: bool, force_compress: bool) -> dict:
+        # 优化A: 快速短路。正常请求(retry=False, force_compress=False)且上下文较小时，
+        # 跳过 deepcopy + json.dumps 估算 + 压缩，只做轻量的预算/推理调整。
+        # 这避免每次正常请求都付出 deepcopy(含base64图片) + 两次 json.dumps 全量估算的代价。
+        if not retry and not force_compress:
+            messages = payloads.get("messages")
+            if isinstance(messages, list):
+                quick_chars = self._quick_estimate_chars(messages)
+                threshold_chars = int(self.cfg.get("provider_compression_threshold", 50000)) * 4
+                if quick_chars < int(threshold_chars * 0.6):
+                    prepared = dict(payloads)
+                    prepared["messages"] = list(messages)
+                    self._ensure_payload_budget(prepared, retry=retry)
+                    self._normalize_reasoning(prepared)
+                    return prepared
+        # 完整路径: 上下文较大或需要重试/强制压缩时，走完整的 deepcopy + 估算 + 压缩
         prepared = copy.deepcopy(payloads)
         self._ensure_payload_budget(prepared, retry=retry)
         self._normalize_reasoning(prepared)
@@ -272,7 +338,7 @@ class LengthErrorHandlerPlugin(Star):
             logger.info(f"[LengthErrorHandler] retry payload.max_tokens 设置为 {target}")
 
     def _normalize_reasoning(self, payloads: dict):
-        if not self.cfg.get("force_reasoning_effort_low", True):
+        if not self.cfg.get("force_reasoning_effort_low", False):
             return
         low_values = {"low", "minimal", "none"}
         current = payloads.get("reasoning_effort")
@@ -1014,6 +1080,46 @@ class LengthErrorHandlerPlugin(Star):
     def _is_tool_call_part(part: dict[str, Any]) -> bool:
         return part.get("type") in {"function_call", "tool_use"}
 
+    def _quick_estimate_chars(self, messages: list[Any]) -> int:
+        # 优化A: 轻量估算消息总字符数，不做 json.dumps，不 deepcopy。
+        # 只用于快速判断是否需要进入完整压缩流程，作为下界估算(实际 tokens 约 = chars/4)。
+        total = 0
+        for msg in messages:
+            if isinstance(msg, dict):
+                content = msg.get("content")
+                tc = msg.get("tool_calls")
+            else:
+                content = getattr(msg, "content", None)
+                tc = getattr(msg, "tool_calls", None)
+            total += self._content_char_len(content)
+            if isinstance(tc, list):
+                for call in tc:
+                    if isinstance(call, dict):
+                        fn = call.get("function")
+                        if isinstance(fn, dict) and isinstance(fn.get("arguments"), str):
+                            total += len(fn["arguments"])
+        return total
+
+    def _content_char_len(self, content: Any) -> int:
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            n = 0
+            for part in content:
+                if isinstance(part, dict):
+                    if "text" in part and isinstance(part.get("text"), str):
+                        n += len(part["text"])
+                    elif part.get("type") == "image_url":
+                        n += 200
+                    else:
+                        n += 50
+                else:
+                    n += len(str(part))
+            return n
+        return len(str(content))
+
     def _estimate_messages_tokens(self, messages: list[Any]) -> int:
         protected_image_indexes = self._protected_inline_image_indexes(messages)
         try:
@@ -1077,12 +1183,16 @@ class LengthErrorHandlerPlugin(Star):
         return " ".join(str(content).split())
 
     def _ensure_runner_budget(self, runner: Any, retry: bool):
+        # 优化: 只在 retry=True 时才动 runner 的 model_config，正常请求绝不修改全局配置，
+        # 避免把 min_completion_tokens 的副作用残留到后续请求。
+        if not retry:
+            return
         try:
             provider = getattr(runner, "provider", None)
             config = getattr(provider, "curr_model_config", None)
             if config is None:
                 return
-            target = int(self.cfg.get("retry_completion_tokens" if retry else "min_completion_tokens", 4096 if retry else 2048))
+            target = int(self.cfg.get("retry_completion_tokens", 4096))
             for attr in ("max_completion_tokens", "max_tokens"):
                 current = getattr(config, attr, None)
                 if isinstance(current, int) and current < target:
@@ -1158,7 +1268,7 @@ class LengthErrorHandlerPlugin(Star):
     async def test_compression(self, event: AstrMessageEvent):
         c = self.cfg
         yield event.plain_result(
-            f"智能压缩 v1.0.8\n"
+            f"智能压缩 v1.0.9\n"
             f"上下文压缩: {c.get('enable_context_compression')}\n"
             f"Runner 阈值: {c.get('compression_threshold')} tokens\n"
             f"Provider 阈值: {c.get('provider_compression_threshold')} tokens\n"
